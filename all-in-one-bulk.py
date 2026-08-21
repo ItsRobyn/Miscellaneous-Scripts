@@ -70,7 +70,7 @@ BASIC_AUTH_PASS = ""
 
 TARGET_EMAIL = "migrations@pressable.com"
 
-MIGRATION_EMAIL = "robyn.davies@pressable.com"
+MIGRATION_EMAIL = ""
 
 # NEW: If set, this single password is used to log in to WP Admin on EVERY site
 # in ORIGIN_URLS. When set, the per-site "do you have a password?" prompt, Phase 2
