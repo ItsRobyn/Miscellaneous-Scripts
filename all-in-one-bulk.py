@@ -17,6 +17,10 @@ What it does, per site in ORIGIN_URLS:
 Because step 4 needs a human to check email and paste a reset link, this is
 still a sequential, hands-on process for each site — it just saves you from
 re-running the script and re-entering the config for every URL.
+
+Set SITE_CREATION_ONLY = True to stop after step 2: the sites are created and
+their details/credentials printed (plus a summary at the end), but no browser is
+opened and no password resets or logins are attempted on the origin sites.
 """
 
 import time
@@ -49,11 +53,21 @@ CLIENT_SECRET = ""
 
 # NEW: List of origin sites to migrate, processed one at a time in order.
 ORIGIN_URLS = [
-    "https://test1.com",
-    "https://test2.com",
+
 ]
 
-DATACENTER = "BUR"  # Example: DCA washington, BUR los angeles, DFW dallas, AMS, etc.
+# Datacenter code to create every site in. Must be one of VALID_DATACENTERS below.
+# Leave blank ("") to be asked which datacenter to use for EACH site as it is created.
+DATACENTER = ""
+
+# Datacenter codes Pressable accepts for site creation (code: location).
+# If Pressable adds a new datacenter, add it here.
+VALID_DATACENTERS = {
+    "AMS": "Amsterdam, NL",
+    "BUR": "Los Angeles, CA, USA",
+    "DCA": "Washington, DC, USA",
+    "DFW": "Dallas, TX, USA",
+}
 
 # NEW: Set a custom name for the Pressable site.
 # If left blank (""), it will automatically extract the name from each origin URL.
@@ -94,6 +108,19 @@ ALWAYS_SKIP_PASSWORD_PROMPT = False
 DO_PHASE_1_CREATE_SITE = True         # Create site (False skips creation but STILL gathers info)
 DO_PHASE_2_REQUEST_RESET = True       # Trigger the origin password reset link
 DO_PHASE_3_PROCESS_MIGRATION = True   # Input reset link, login, and start migration
+
+# NEW: If True, the script ONLY creates the sites and prints their details
+# (staging URL, IPs, SFTP username/password), then prints a summary of every
+# site at the end. Phases 2 and 3 are forced off regardless of the toggles
+# above — no browser is opened, no password prompts are shown, and no password
+# resets or logins are attempted on the origin sites.
+SITE_CREATION_ONLY = False
+
+# Enforce SITE_CREATION_ONLY by switching off the browser phases here, so the
+# rest of the script doesn't need to check both settings everywhere.
+if SITE_CREATION_ONLY:
+    DO_PHASE_2_REQUEST_RESET = False
+    DO_PHASE_3_PROCESS_MIGRATION = False
 
 
 # ---[ PRESSABLE API HELPER FUNCTIONS ]---
@@ -479,16 +506,73 @@ async def process_existing_password_migration(page, existing_password, target_em
         print(f"  ❌ Error during login and migration sequence: {str(e)[:100]}")
 
 
+# ---[ DATACENTER HELPERS ]---
+
+def prompt_for_datacenter(origin_url: str) -> str:
+    """Interactively ask which datacenter to create the site in.
+
+    Used when DATACENTER is left blank. Shows a numbered list of the codes in
+    VALID_DATACENTERS and accepts either the number or the code itself
+    (case-insensitive). Keeps asking until a valid answer is given."""
+    codes = list(VALID_DATACENTERS.keys())
+    print(f"\nWhich datacenter should the site for {origin_url} be created in?")
+    for number, code in enumerate(codes, start=1):
+        print(f"  {number}. {code} - {VALID_DATACENTERS[code]}")
+
+    while True:
+        answer = input(" Enter a number or datacenter code: ").strip().upper()
+
+        # Accept the list number (e.g. "2")...
+        if answer.isdigit() and 1 <= int(answer) <= len(codes):
+            return codes[int(answer) - 1]
+        # ...or the code itself (e.g. "BUR")
+        if answer in VALID_DATACENTERS:
+            return answer
+
+        print(f" ⚠️ '{answer}' is not a valid choice. Please enter 1-{len(codes)} or one of: {', '.join(codes)}")
+
+
+# ---[ SUMMARY HELPERS ]---
+
+def print_site_summary(site_summary: list):
+    """Print every site's details together at the end of the run, so they
+    don't have to be picked out of the per-site output.
+
+    Each entry in site_summary is a dict with an "origin" key plus either the
+    gathered details ("staging", "ips", "sftp_user", "sftp_password") or an
+    "error" key describing why that site's details couldn't be gathered."""
+    print("\n==================== SUMMARY ====================")
+    if not site_summary:
+        print("No sites were processed.")
+        return
+
+    for entry in site_summary:
+        print(f"\nOrigin:        {entry['origin']}")
+        if "error" in entry:
+            print(f"  ❌ {entry['error']}")
+            continue
+        print(f"Staging URL:   {entry['staging']}")
+        print(f"IPs:           {entry['ips'] or '(none found)'}")
+        print(f"SFTP Username: {entry['sftp_user']}")
+        print(f"SFTP Password: {entry['sftp_password']}")
+
+    failed = sum(1 for entry in site_summary if "error" in entry)
+    print(f"\n{len(site_summary) - failed} succeeded, {failed} failed.")
+    print("=================================================")
+
+
 # ---[ PER-SITE ORCHESTRATION ]---
 
 async def process_single_site(token, origin_url, page, datacenter, target_email, migration_email,
                                custom_site_name, custom_login_url, global_wp_admin_password,
-                               always_skip_password_prompt):
+                               always_skip_password_prompt, site_summary):
     """Runs Phases 1-3 for a single origin site. `page` is the shared
     Playwright page reused across every site in the bulk run (None if no
-    browser automation phases are enabled). Returns the page to use for the
-    next site — normally the same one passed in, but a fresh page if the
-    original had to be recreated after the browser crashed mid-run."""
+    browser automation phases are enabled). The site's gathered details (or
+    an error) are appended to `site_summary` for the end-of-run summary.
+    Returns the page to use for the next site — normally the same one passed
+    in, but a fresh page if the original had to be recreated after the
+    browser crashed mid-run."""
 
     new_password = generate_password()
 
@@ -505,6 +589,9 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
     if DO_PHASE_1_CREATE_SITE:
         print("\n---[ PHASE 1: Pressable API Site Creation ]---")
         desired_name = next_available_name(token, base_name)
+        # No datacenter configured, so ask which one to use for this site
+        if not datacenter:
+            datacenter = prompt_for_datacenter(origin_url)
         print(f"Creating site '{desired_name}' in Datacenter '{datacenter}'...")
         create_site(token, desired_name, datacenter)
 
@@ -520,6 +607,10 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
     site = get_site_with_ips(token, clean_hostname, desired_name)
     if not site:
         print(f"⚠️ Could not locate the site via API using domain '{clean_hostname}' or fallback name '{desired_name}'.")
+        site_summary.append({
+            "origin": origin_url,
+            "error": f"Could not locate the site via API (domain '{clean_hostname}' / name '{desired_name}').",
+        })
     else:
         site_id = site["id"]
         staging_url = site.get("url") or ""
@@ -556,6 +647,19 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
         print(f"  Staging URL: {staging_url}")
         print(f"  SFTP Username: {sftp_user}")
         print(f"  SFTP Password: {sftp_password}")
+
+        site_summary.append({
+            "origin": origin_url,
+            "staging": staging_url,
+            "ips": ip_str,
+            "sftp_user": sftp_user,
+            "sftp_password": sftp_password,
+        })
+
+    # Site-creation-only mode stops here: no credential prompt, no reset, no login.
+    if SITE_CREATION_ONLY:
+        print("\n---[ SITE_CREATION_ONLY: skipping credential check, Phase 2 and Phase 3 ]---")
+        return page
 
     # ---[ Credential Check: skip the whole reset flow if a working password is already known ]---
     existing_password = global_wp_admin_password
@@ -670,7 +774,8 @@ async def main():
     # 1. Load Hardcoded Inputs
     client_id = CLIENT_ID.strip()
     client_secret = CLIENT_SECRET.strip()
-    datacenter = DATACENTER.strip().upper() or "DCA"
+    # Blank means "ask for each site" (handled in process_single_site)
+    datacenter = DATACENTER.strip().upper()
     target_email = TARGET_EMAIL.strip()
     migration_email = MIGRATION_EMAIL.strip()
 
@@ -683,6 +788,26 @@ async def main():
     if not origin_urls:
         print("❌ ORIGIN_URLS is empty. Add at least one URL and re-run. Exiting.")
         return
+
+    # Catch a mistyped DATACENTER now, before anything is created
+    if datacenter and datacenter not in VALID_DATACENTERS:
+        print(f"❌ DATACENTER '{datacenter}' is not valid. Use one of: {', '.join(VALID_DATACENTERS)} "
+              "(or leave it blank to be asked per site). Exiting.")
+        return
+    if not datacenter and DO_PHASE_1_CREATE_SITE:
+        print("ℹ️ DATACENTER is blank — you will be asked which datacenter to use for each site.")
+
+    if SITE_CREATION_ONLY:
+        print("ℹ️ SITE_CREATION_ONLY is set — sites will be created and their details printed, "
+              "but no password resets or logins will be attempted.")
+        # Without Phase 1 this mode only looks up existing sites (and still resets
+        # their SFTP passwords to display them), which is probably not intended.
+        if not DO_PHASE_1_CREATE_SITE:
+            print("⚠️ DO_PHASE_1_CREATE_SITE is False, so no sites will be created — this run will only "
+                  "look up existing sites and RESET their SFTP passwords.")
+
+    # Collects each site's details (or error) for the summary at the end of the run
+    site_summary = []
 
     # ---[ API Authentication (shared across all sites) ]---
     print("\n---[ Authenticating with Pressable API ]---")
@@ -725,7 +850,7 @@ async def main():
                     page = await process_single_site(
                         token, origin_url, page, datacenter, target_email, migration_email,
                         custom_site_name, custom_login_url, global_wp_admin_password,
-                        always_skip_password_prompt
+                        always_skip_password_prompt, site_summary
                     )
                 except Exception as e:
                     print(f"❌ Unhandled error processing {origin_url}: {str(e)[:200]}")
@@ -741,11 +866,17 @@ async def main():
                 await process_single_site(
                     token, origin_url, None, datacenter, target_email, migration_email,
                     custom_site_name, custom_login_url, global_wp_admin_password,
-                    always_skip_password_prompt
+                    always_skip_password_prompt, site_summary
                 )
             except Exception as e:
                 print(f"❌ Unhandled error processing {origin_url}: {str(e)[:200]}")
                 print("   Moving on to the next site...")
+                site_summary.append({"origin": origin_url, "error": f"Unhandled error: {str(e)[:200]}"})
+
+        # The summary is only shown in SITE_CREATION_ONLY mode, where the run is
+        # all about collecting each new site's details in one place.
+        if SITE_CREATION_ONLY:
+            print_site_summary(site_summary)
 
         print("\n🎉 Bulk automation complete!")
 
