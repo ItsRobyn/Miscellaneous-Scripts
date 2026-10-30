@@ -2,25 +2,30 @@
 """
 Pressable End-to-End Migration Automation (Bulk)
 
-Same as all-in-one.py, but processes a list of origin sites one after
-another instead of a single hardcoded URL.
+Processes a list of origin sites (ORIGIN_URLS) one after another.
 
-What it does, per site in ORIGIN_URLS:
-1. Authenticates with Pressable API (once, shared across all sites).
-   Creates the site (if enabled).
-2. Always fetches SFTP credentials for the target site (forcing a password reset).
-3. Uses Playwright (with stealth) to request a password reset on the Origin site.
-4. Pauses and waits for you to paste the password reset link from your email.
-5. Automatically changes the Origin password, logs in, checks for Yoast,
-   installs the Pressable migration plugin, and starts the migration.
+What it does, per site:
+1. Creates the site on Pressable via the API (if enabled), then fetches the
+   new site's staging URL, IPs and SFTP credentials (forcing an SFTP password
+   reset so the password can be shown).
+2. Uses Playwright (with stealth) to request a WP password reset on the
+   origin site for TARGET_EMAIL.
+3. Pauses for you to paste the reset link from your email, sets a new
+   password (a different one for every site), logs in, optionally turns on
+   maintenance mode, installs the Pressable migration plugin and starts the
+   migration.
 
-Because step 4 needs a human to check email and paste a reset link, this is
+At the end of the run a summary lists every site's details, its new WP
+password and what happened to it, so nothing has to be picked out of the
+per-site output.
+
+Set SITE_CREATION_ONLY = True to stop after step 1: the sites are created and
+their details printed, but no browser is opened and no password resets or
+logins are attempted on the origin sites.
+
+Because step 3 needs a human to check email and paste a reset link, this is
 still a sequential, hands-on process for each site — it just saves you from
 re-running the script and re-entering the config for every URL.
-
-Set SITE_CREATION_ONLY = True to stop after step 2: the sites are created and
-their details/credentials printed (plus a summary at the end), but no browser is
-opened and no password resets or logins are attempted on the origin sites.
 """
 
 import time
@@ -31,11 +36,11 @@ import asyncio
 import tempfile
 import socket
 import secrets
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import requests
 from playwright.async_api import async_playwright
-# --- FIXED IMPORT ---
 from playwright_stealth import Stealth
 
 try:
@@ -46,15 +51,20 @@ except ImportError:
 
 # ==========================================
 # ---[ CONFIGURATION SETTINGS ]---
-# Hardcode your variables here before running
+# Hardcode your variables here before running.
+# Never commit real credentials to the repo.
 # ==========================================
-CLIENT_ID = ""
-CLIENT_SECRET = ""
+CLIENT_ID = ""      # Mandatory: Pressable API client ID
+CLIENT_SECRET = ""  # Mandatory: Pressable API client secret
 
-# NEW: List of origin sites to migrate, processed one at a time in order.
-ORIGIN_URLS = [
-
-]
+# Origin sites to migrate, one per line, processed in order.
+# Each line can optionally say where the site's login page is:
+#   example.com                                  -> CUSTOM_LOGIN_URL below, else /wp-login.php
+#   example.com/wp-admin/                        -> a path on the URL is used as the login page
+#   example.com /my-login/                       -> a second column gives the login path...
+#   example.com https://example.com/my-login/    -> ...or the full login URL
+ORIGIN_URLS = """
+"""
 
 # Datacenter code to create every site in. Must be one of VALID_DATACENTERS below.
 # Leave blank ("") to be asked which datacenter to use for EACH site as it is created.
@@ -69,36 +79,40 @@ VALID_DATACENTERS = {
     "DFW": "Dallas, TX, USA",
 }
 
-# NEW: Set a custom name for the Pressable site.
+# Set a custom name for the Pressable site.
 # If left blank (""), it will automatically extract the name from each origin URL.
 CUSTOM_SITE_NAME = ""
 
-# NEW: Set a custom WP-Admin login URL if the site doesn't use the standard /wp-login.php
-# Example: "https://example.com/my-custom-login/"
-# Applies to every site in ORIGIN_URLS — leave blank unless all sites share this path.
+# FALLBACK: login URL or path used for any site in ORIGIN_URLS that doesn't give
+# its own. Can be a full URL ("https://example.com/my-login/") or just a path
+# ("/my-login/"), which is added to each site's own address.
 CUSTOM_LOGIN_URL = ""
 
-# NEW: Basic HTTP Auth (Used ONLY if the server prompts for it)
+# Basic HTTP Auth (Used ONLY if the server prompts for it)
 BASIC_AUTH_USER = ""
 BASIC_AUTH_PASS = ""
 
+# WP Admin account on the origin sites that the password reset and login use.
 TARGET_EMAIL = "migrations@pressable.com"
 
+# Email address entered in the Pressable migration plugin (receives migration updates).
 MIGRATION_EMAIL = ""
 
-# NEW: If set, this single password is used to log in to WP Admin on EVERY site
-# in ORIGIN_URLS. When set, the per-site "do you have a password?" prompt, Phase 2
-# (request reset), and the password reset step are all skipped entirely — it goes
-# straight to login using this password. Leave blank ("") to go through the normal
-# per-site prompt/reset flow instead.
+# If set, this single password is used to log in to WP Admin on EVERY site in
+# ORIGIN_URLS, and the password reset steps are skipped entirely. Leave blank ("")
+# to go through the password reset flow instead.
 GLOBAL_WP_ADMIN_PASSWORD = ""
 
-# NEW: If True, skips the per-site "do you already have a working password?" prompt
-# and goes straight into the password reset flow (Phase 2) for every site — useful
-# when you know none of the sites in ORIGIN_URLS have a usable password yet and every
-# one of them will need a reset. Ignored if GLOBAL_WP_ADMIN_PASSWORD is set, since
-# that already skips the prompt (and the reset) on its own.
-ALWAYS_SKIP_PASSWORD_PROMPT = False
+# If True, you're asked per site whether to turn on maintenance mode, which
+# WP Admin email to use, and whether you already have a working password (or
+# want to skip the site). If False, no per-site questions are asked: every site
+# uses ENABLE_MAINTENANCE_MODE and TARGET_EMAIL and goes straight to the
+# password reset flow.
+VERBOSE_QUESTIONS = False
+
+# Whether to turn on maintenance mode on the origin site before migrating, when
+# VERBOSE_QUESTIONS is False. Installs and activates the "maintenance" plugin.
+ENABLE_MAINTENANCE_MODE = False
 
 # ==========================================
 # ---[ EXECUTION PHASES ]---
@@ -109,11 +123,11 @@ DO_PHASE_1_CREATE_SITE = True         # Create site (False skips creation but ST
 DO_PHASE_2_REQUEST_RESET = True       # Trigger the origin password reset link
 DO_PHASE_3_PROCESS_MIGRATION = True   # Input reset link, login, and start migration
 
-# NEW: If True, the script ONLY creates the sites and prints their details
-# (staging URL, IPs, SFTP username/password), then prints a summary of every
-# site at the end. Phases 2 and 3 are forced off regardless of the toggles
-# above — no browser is opened, no password prompts are shown, and no password
-# resets or logins are attempted on the origin sites.
+# If True, the script ONLY creates the sites and prints their details
+# (staging URL, IPs, SFTP username/password), then the summary. Phases 2 and 3
+# are forced off regardless of the toggles above — no browser is opened, no
+# password prompts are shown, and no password resets or logins are attempted
+# on the origin sites.
 SITE_CREATION_ONLY = False
 
 # Enforce SITE_CREATION_ONLY by switching off the browser phases here, so the
@@ -123,13 +137,27 @@ if SITE_CREATION_ONLY:
     DO_PHASE_3_PROCESS_MIGRATION = False
 
 
+@dataclass
+class Settings:
+    """The per-run settings from the configuration above, cleaned up and
+    gathered into one object so they can be passed around together."""
+    datacenter: str
+    target_email: str
+    migration_email: str
+    custom_site_name: str
+    custom_login_url: str
+    global_wp_admin_password: str
+    verbose_questions: bool
+    enable_maintenance_mode: bool
+
+
 # ---[ PRESSABLE API HELPER FUNCTIONS ]---
 
 API_BASE = "https://my.pressable.com"
 V1 = f"{API_BASE}/v1"
 
 def generate_password() -> str:
-    """Generate a fresh random password. Called per-site so no two sites
+    """Generate a fresh random password. Called per site so no two sites
     in a bulk run ever share a password."""
     return "".join(secrets.choice(string.ascii_letters + string.digits + "!@#$%^&*_-") for _ in range(16))
 
@@ -206,6 +234,9 @@ def create_site(token: str, name: str, datacenter_code: str) -> dict:
     url = f"{V1}/sites"
     body = {"name": name, "datacenter_code": datacenter_code}
     resp = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=120)
+    if not resp.ok:
+        # Show the API's own explanation (e.g. plan limit reached) before raising
+        print(f"  ❌ Site creation failed. API response: {resp.text}")
     resp.raise_for_status()
     return resp.json()
 
@@ -258,7 +289,11 @@ def get_sftp_credentials(token: str, site_id: str, max_retries: int = 10, delay:
             if reset_resp.status_code != 200:
                 raise RuntimeError(f"API Error resetting password: {reset_resp.text}")
 
+            # Guard against a 200 response with no password in it, which would
+            # otherwise be shown (and used in the migration) as the text "None"
             sftp_password = reset_resp.json().get("data")
+            if not sftp_password:
+                raise RuntimeError(f"SFTP password reset for '{sftp_user}' returned no password: {reset_resp.text}")
             return sftp_user, str(sftp_password)
 
         # If the user doesn't exist yet, wait and try again
@@ -267,6 +302,46 @@ def get_sftp_credentials(token: str, site_id: str, max_retries: int = 10, delay:
 
     # If the loop exhausts all retries, then we throw the error
     raise RuntimeError(f"No SFTP users exist for site {site_id} after waiting {max_retries * delay} seconds.")
+
+
+# ---[ URL PARSING HELPERS ]---
+
+def _build_login_url(base_url: str, login: str) -> str:
+    """Turn a login URL or path into a full URL. Full URLs are used as-is;
+    paths (with or without a leading slash) are added to base_url."""
+    if login.startswith(("http://", "https://")):
+        return login
+    path = login if login.startswith("/") else f"/{login}"
+    return f"{base_url}{path}"
+
+def parse_origin_line(line: str, global_custom_login: str) -> tuple[str, str]:
+    """Split one ORIGIN_URLS line into (base_url, wp_login_url).
+
+    The login page is chosen in this order:
+    1. A second column on the line (a full URL or a path)
+    2. A path on the origin URL itself (e.g. example.com/wp-admin/)
+    3. The global CUSTOM_LOGIN_URL
+    4. The WordPress default, /wp-login.php
+
+    Returns ("", "") if no usable URL can be read from the line."""
+    parts = line.strip().split()
+    if not parts:
+        return "", ""
+
+    raw_origin = parts[0]
+    full_origin = raw_origin if "://" in raw_origin else f"https://{raw_origin}"
+    parsed = urlparse(full_origin)
+    if not parsed.netloc:
+        return "", ""
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    if len(parts) >= 2:
+        return base_url, _build_login_url(base_url, parts[1])
+    if parsed.path not in ("", "/"):
+        return base_url, full_origin
+    if global_custom_login:
+        return base_url, _build_login_url(base_url, global_custom_login)
+    return base_url, f"{base_url}/wp-login.php"
 
 
 # ---[ PLAYWRIGHT AUTOMATION FUNCTIONS ]---
@@ -284,6 +359,16 @@ async def goto_with_retries(page, url, retries=2, **goto_kwargs):
             if attempt < retries:
                 print(f"  ⚠️ Navigation to {url} failed ({str(e)[:80]}), retrying ({attempt + 1}/{retries})...")
     raise last_error
+
+async def click_magic_link_fallback(page):
+    """iThemes / Solid Security can replace the login form with a "magic link"
+    form. If its fallback link is showing, click it to get the standard form."""
+    fallback_selector = "a.itsec-pwls-login-fallback__link"
+    if await page.is_visible(fallback_selector):
+        print("  ℹ️ Magic link fallback detected. Clicking to reveal the standard form...")
+        await page.click(fallback_selector)
+        await page.wait_for_load_state("networkidle")
+        await asyncio.sleep(1)
 
 class UserNotFoundError(Exception):
     """Raised when the origin site's lost-password form reports that no
@@ -311,14 +396,7 @@ async def _attempt_password_reset_request(page, wp_login_url, target_email):
     await page.goto(wp_login_url, wait_until="networkidle", timeout=15000)
     await asyncio.sleep(1.5) # Let security scripts settle
 
-    # --- NEW: Handle iThemes / Solid Security Magic Link ---
-    fallback_selector = "a.itsec-pwls-login-fallback__link"
-    if await page.is_visible(fallback_selector):
-        print("  ℹ️ Magic link fallback detected. Clicking to reveal standard form...")
-        await page.click(fallback_selector)
-        await page.wait_for_load_state("networkidle")
-        await asyncio.sleep(1)
-    # -------------------------------------------------------
+    await click_magic_link_fallback(page)
 
     if "action=lostpassword" not in page.url:
         lost_password_selector = "a[href*='action=lostpassword']"
@@ -400,20 +478,78 @@ async def reset_password_on_origin(page, reset_link, new_password):
     await asyncio.sleep(2) # Give the database a second to process the new hash
 
 
-async def login_and_run_migration(page, password, target_email, migration_email, sftp_data, base_url, wp_login_url):
-    # Log in to the site
-    print(f"🚀 [Playwright] Logging into {wp_login_url}...")
+async def ensure_plugin_active(page, base_url, plugin_slug) -> bool:
+    """Make sure a wordpress.org plugin is installed and active on the origin
+    site, installing and/or activating it from the plugin search page as needed.
+    Returns False (rather than raising) if the plugin can't be found, so the
+    caller can decide whether that's fatal."""
+    print(f"  ℹ️ Checking plugin: {plugin_slug}...")
+    target_plugin_url = f"{base_url}/wp-admin/plugin-install.php?s={plugin_slug}&tab=search&type=term"
+    await page.goto(target_plugin_url, wait_until="networkidle")
+    await asyncio.sleep(1.5)
+
+    plugin_card = f".plugin-card-{plugin_slug}"
+    try:
+        await page.wait_for_selector(plugin_card, state="visible", timeout=15000)
+    except Exception as e:
+        print(f"  ⚠️ Plugin {plugin_slug} not found in search results ({str(e)[:80]}).")
+        return False
+
+    install_btn = f"{plugin_card} a.install-now"
+    activate_btn = f"{plugin_card} a.activate-now"
+
+    if await page.is_visible(activate_btn):
+        print(f"  ℹ️ {plugin_slug} is installed but inactive. Activating...")
+        await page.click(activate_btn)
+        await page.wait_for_load_state("networkidle")
+    elif await page.is_visible(install_btn):
+        print(f"  ℹ️ {plugin_slug} is not installed. Installing...")
+        await page.click(install_btn)
+        await page.wait_for_selector(activate_btn, state="visible", timeout=45000)
+        await asyncio.sleep(1) # Pause between install and activation
+        print(f"  ℹ️ {plugin_slug} installed. Activating...")
+        await page.click(activate_btn)
+        await page.wait_for_load_state("networkidle")
+    else:
+        print(f"  ✅ {plugin_slug} is already installed and active.")
+
+    await asyncio.sleep(1.5)
+    return True
+
+
+async def turn_on_maintenance_mode(page, base_url) -> bool:
+    """Install/activate the "maintenance" plugin and switch it on. Failure here
+    is reported but not fatal — the migration can still go ahead.
+    Returns True if maintenance mode was turned on."""
+    print("🚀 [Playwright] Setting up Maintenance Mode...")
+    if not await ensure_plugin_active(page, base_url, "maintenance"):
+        print("  ⚠️ Maintenance plugin unavailable — continuing without maintenance mode.")
+        return False
+
+    await page.goto(f"{base_url}/wp-admin/admin.php?page=maintenance", wait_until="networkidle")
+    await asyncio.sleep(1)
+    try:
+        # Tick the plugin's on/off checkbox directly, then save the settings
+        await page.evaluate('document.querySelector("input#state").checked = true')
+        await page.click("input#submit")
+        await page.wait_for_load_state("networkidle")
+        print("  ✅ Maintenance mode turned ON.")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Could not turn on maintenance mode automatically ({str(e)[:80]}). Turn it on manually if needed.")
+        return False
+
+
+async def login_and_run_migration(page, password, target_email, migration_email, sftp_data,
+                                  base_url, wp_login_url, enable_maintenance):
+    """Log in to the origin site, optionally turn on maintenance mode, then
+    install the Pressable migration plugin and submit the migration.
+    Raises on any failure. Returns (migration_url, maintenance_on)."""
+    print(f"🚀 [Playwright] Logging into {wp_login_url} as {target_email}...")
     await goto_with_retries(page, wp_login_url, retries=2, wait_until="networkidle", timeout=15000)
     await asyncio.sleep(1.5)
 
-    # --- NEW: Handle iThemes / Solid Security Magic Link ---
-    fallback_selector = "a.itsec-pwls-login-fallback__link"
-    if await page.is_visible(fallback_selector):
-        print("  ℹ️ Magic link fallback detected. Clicking to reveal standard login...")
-        await page.click(fallback_selector)
-        await page.wait_for_load_state("networkidle")
-        await asyncio.sleep(1)
-    # -------------------------------------------------------
+    await click_magic_link_fallback(page)
 
     await page.wait_for_selector("input[name='log']", state="visible", timeout=10000)
     await page.fill("input[name='log']", target_email)
@@ -424,42 +560,24 @@ async def login_and_run_migration(page, password, target_email, migration_email,
     await page.wait_for_load_state("networkidle", timeout=60000)
     await asyncio.sleep(1.5)
 
-    # --- NEW: Check for Yoast SEO ---
+    # Check for Yoast SEO
     page_content = await page.content()
     if "yoast" in page_content.lower():
         print("  ✅ Yoast SEO plugin detected on the dashboard.")
     else:
         print("  ℹ️ Yoast SEO plugin not found on the dashboard.")
-    # --------------------------------
 
-    # Install & Activate Plugin
-    PLUGIN_SLUG = "pressable-automated-migration"
-    target_plugin_url = f"{base_url}/wp-admin/plugin-install.php?s={PLUGIN_SLUG}&tab=search&type=term"
-    print(f"🚀 [Playwright] Installing Migration Plugin...")
-    await page.goto(target_plugin_url, wait_until="networkidle")
-    await asyncio.sleep(1.5)
+    maintenance_on = False
+    if enable_maintenance:
+        maintenance_on = await turn_on_maintenance_mode(page, base_url)
 
-    plugin_card = f".plugin-card-{PLUGIN_SLUG}"
-    await page.wait_for_selector(plugin_card, state="visible", timeout=15000)
+    # Install & activate the migration plugin — without it nothing else can happen
+    print("🚀 [Playwright] Setting up Pressable Migration Plugin...")
+    if not await ensure_plugin_active(page, base_url, "pressable-automated-migration"):
+        raise RuntimeError("Could not install/activate the pressable-automated-migration plugin.")
 
-    install_btn = f"{plugin_card} a.install-now"
-    activate_btn = f"{plugin_card} a.activate-now"
-
-    if await page.is_visible(activate_btn):
-        print(f"  ℹ️ Plugin installed but inactive. Activating...")
-        await page.click(activate_btn)
-        await page.wait_for_load_state("networkidle")
-    elif await page.is_visible(install_btn):
-        print(f"  ℹ️ Plugin not installed. Installing...")
-        await page.click(install_btn)
-        await page.wait_for_selector(activate_btn, state="visible", timeout=45000)
-        await asyncio.sleep(1) # Pause between install and activation
-        print(f"  ℹ️ Plugin installed. Activating...")
-        await page.click(activate_btn)
-        await page.wait_for_load_state("networkidle")
-    else:
-        print(f"  ✅ Plugin is already installed and active.")
-
+    print(f"🚀 [Playwright] Navigating to the migration page...")
+    await page.goto(f"{base_url}/wp-admin/admin.php?page=pressable", wait_until="networkidle")
     await asyncio.sleep(1.5)
 
     # Fill Migration Form
@@ -488,25 +606,28 @@ async def login_and_run_migration(page, password, target_email, migration_email,
     # Show the page the plugin lands on after submitting, so it can be checked
     # per site before the bulk loop moves on to the next one.
     print(f"  🔗 Migration URL: {page.url}")
+    return page.url, maintenance_on
 
 
-async def process_reset_and_migrate(page, reset_link, new_password, target_email, migration_email, sftp_data, base_url, wp_login_url):
+async def start_migration(page, password, target_email, migration_email, sftp_data,
+                          base_url, wp_login_url, enable_maintenance, record):
+    """Run login_and_run_migration(), catching any error so one failed site
+    doesn't stop the bulk run, and record the outcome in the site's summary."""
     try:
-        await reset_password_on_origin(page, reset_link, new_password)
-        await login_and_run_migration(page, new_password, target_email, migration_email, sftp_data, base_url, wp_login_url)
-    except Exception as e:
-        print(f"  ❌ Error during reset and migration sequence: {str(e)[:100]}")
-
-
-async def process_existing_password_migration(page, existing_password, target_email, migration_email, sftp_data, base_url, wp_login_url):
-    print(f"\n🚀 [Playwright] Using existing password — skipping password reset...")
-    try:
-        await login_and_run_migration(page, existing_password, target_email, migration_email, sftp_data, base_url, wp_login_url)
+        migration_url, maintenance_on = await login_and_run_migration(
+            page, password, target_email, migration_email, sftp_data,
+            base_url, wp_login_url, enable_maintenance
+        )
+        record["status"] = "Migration started"
+        record["migration_url"] = migration_url
+        if enable_maintenance:
+            record["maintenance"] = "ON" if maintenance_on else "FAILED — check manually"
     except Exception as e:
         print(f"  ❌ Error during login and migration sequence: {str(e)[:100]}")
+        record["status"] = f"Failed during login/migration: {str(e)[:100]}"
 
 
-# ---[ DATACENTER HELPERS ]---
+# ---[ PROMPT HELPERS ]---
 
 def prompt_for_datacenter(origin_url: str) -> str:
     """Interactively ask which datacenter to create the site in.
@@ -532,56 +653,86 @@ def prompt_for_datacenter(origin_url: str) -> str:
         print(f" ⚠️ '{answer}' is not a valid choice. Please enter 1-{len(codes)} or one of: {', '.join(codes)}")
 
 
+def prompt_for_sftp_details():
+    """Ask for the target site's details by hand, for when they couldn't be
+    gathered from the API. Returns None if the staging URL is left blank,
+    meaning the site should be skipped."""
+    print("⚠️ WARNING: No SFTP credentials were gathered from the API.")
+    staging = input(" Enter Target Staging URL (or press Enter to skip this site): ").strip()
+    if not staging:
+        return None
+    return {
+        "staging": staging,
+        "sftp_user": input(" Enter SFTP Username: ").strip(),
+        "sftp_password": input(" Enter SFTP Password: ").strip(),
+    }
+
+
 # ---[ SUMMARY HELPERS ]---
+
+# Summary fields in the order they're printed: (dictionary key, label)
+SUMMARY_FIELDS = [
+    ("status", "Status"),
+    ("staging", "Staging URL"),
+    ("ips", "IPs"),
+    ("sftp_user", "SFTP Username"),
+    ("sftp_password", "SFTP Password"),
+    ("wp_password", "New WP Password"),
+    ("maintenance", "Maintenance"),
+    ("migration_url", "Migration URL"),
+]
 
 def print_site_summary(site_summary: list):
     """Print every site's details together at the end of the run, so they
     don't have to be picked out of the per-site output.
 
-    Each entry in site_summary is a dict with an "origin" key plus either the
-    gathered details ("staging", "ips", "sftp_user", "sftp_password") or an
-    "error" key describing why that site's details couldn't be gathered."""
+    Each entry in site_summary is a dict with an "origin" and a "status" key,
+    plus whichever of the other SUMMARY_FIELDS were gathered for that site."""
     print("\n==================== SUMMARY ====================")
     if not site_summary:
         print("No sites were processed.")
         return
 
     for entry in site_summary:
-        print(f"\nOrigin:        {entry['origin']}")
-        if "error" in entry:
-            print(f"  ❌ {entry['error']}")
-            continue
-        print(f"Staging URL:   {entry['staging']}")
-        print(f"IPs:           {entry['ips'] or '(none found)'}")
-        print(f"SFTP Username: {entry['sftp_user']}")
-        print(f"SFTP Password: {entry['sftp_password']}")
+        print(f"\nOrigin:          {entry['origin']}")
+        for key, label in SUMMARY_FIELDS:
+            if entry.get(key):
+                print(f"{label + ':':<17}{entry[key]}")
 
-    failed = sum(1 for entry in site_summary if "error" in entry)
-    print(f"\n{len(site_summary) - failed} succeeded, {failed} failed.")
+    failed = sum(1 for entry in site_summary if entry["status"].startswith("Failed"))
+    skipped = sum(1 for entry in site_summary if entry["status"].startswith("Skipped"))
+    print(f"\n{len(site_summary) - failed - skipped} OK, {skipped} skipped, {failed} failed.")
     print("=================================================")
 
 
 # ---[ PER-SITE ORCHESTRATION ]---
 
-async def process_single_site(token, origin_url, page, datacenter, target_email, migration_email,
-                               custom_site_name, custom_login_url, global_wp_admin_password,
-                               always_skip_password_prompt, site_summary):
+async def process_single_site(token, origin_url, wp_login_url, page, settings, record):
     """Runs Phases 1-3 for a single origin site. `page` is the shared
     Playwright page reused across every site in the bulk run (None if no
-    browser automation phases are enabled). The site's gathered details (or
-    an error) are appended to `site_summary` for the end-of-run summary.
+    browser automation phases are enabled). Details and the outcome are
+    stored in `record` (this site's entry in the end-of-run summary).
     Returns the page to use for the next site — normally the same one passed
     in, but a fresh page if the original had to be recreated after the
     browser crashed mid-run."""
 
-    new_password = generate_password()
-
-    parsed_url = urlparse(origin_url if "://" in origin_url else f"https://{origin_url}")
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     clean_hostname = extract_hostname(origin_url)
+    base_name = settings.custom_site_name if settings.custom_site_name else base_label_from_domain(origin_url)
+    browser_phases = DO_PHASE_2_REQUEST_RESET or DO_PHASE_3_PROCESS_MIGRATION
 
-    wp_login_url = custom_login_url if custom_login_url else f"{base_url}/wp-login.php"
-    base_name = custom_site_name if custom_site_name else base_label_from_domain(origin_url)
+    # ---[ Per-site settings: asked here (if VERBOSE_QUESTIONS) so you can answer up front ]---
+    target_email = settings.target_email
+    enable_maintenance = settings.enable_maintenance_mode
+    if browser_phases:
+        if settings.verbose_questions:
+            print("\n---[ Per-site Questions ]---")
+            answer = input(f" Enable maintenance mode on {origin_url} before migrating? [y/N]: ").strip().lower()
+            enable_maintenance = answer == "y"
+            answer = input(f" WP Admin email to use on {origin_url} (press Enter for '{target_email}'): ").strip()
+            target_email = answer or target_email
+        print(f"  ℹ️ Login page: {wp_login_url}")
+        print(f"  ℹ️ WP Admin email: {target_email}")
+        print(f"  ℹ️ Maintenance mode: {'ON' if enable_maintenance else 'off'}")
 
     sftp_data = None
 
@@ -590,8 +741,7 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
         print("\n---[ PHASE 1: Pressable API Site Creation ]---")
         desired_name = next_available_name(token, base_name)
         # No datacenter configured, so ask which one to use for this site
-        if not datacenter:
-            datacenter = prompt_for_datacenter(origin_url)
+        datacenter = settings.datacenter or prompt_for_datacenter(origin_url)
         print(f"Creating site '{desired_name}' in Datacenter '{datacenter}'...")
         create_site(token, desired_name, datacenter)
 
@@ -607,10 +757,7 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
     site = get_site_with_ips(token, clean_hostname, desired_name)
     if not site:
         print(f"⚠️ Could not locate the site via API using domain '{clean_hostname}' or fallback name '{desired_name}'.")
-        site_summary.append({
-            "origin": origin_url,
-            "error": f"Could not locate the site via API (domain '{clean_hostname}' / name '{desired_name}').",
-        })
+        record["status"] = f"Failed: could not locate the site via API (domain '{clean_hostname}' / name '{desired_name}')"
     else:
         site_id = site["id"]
         staging_url = site.get("url") or ""
@@ -629,8 +776,8 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
             print("  ⚠️ API never returned dedicated IPs after retrying — falling back to DNS (may be inaccurate).")
             try:
                 _, _, ips = socket.gethostbyname_ex(clean_staging_url)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  ⚠️ DNS lookup for {clean_staging_url} failed too: {e}")
 
         ip_str = " ".join(ips)
         print(f"\n{clean_staging_url}\n{ip_str}\n")
@@ -648,29 +795,22 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
         print(f"  SFTP Username: {sftp_user}")
         print(f"  SFTP Password: {sftp_password}")
 
-        site_summary.append({
-            "origin": origin_url,
-            "staging": staging_url,
-            "ips": ip_str,
-            "sftp_user": sftp_user,
-            "sftp_password": sftp_password,
-        })
+        record.update(sftp_data)
+        record["ips"] = ip_str
+        record["status"] = "Site details gathered"
 
-    # Site-creation-only mode stops here: no credential prompt, no reset, no login.
-    if SITE_CREATION_ONLY:
-        print("\n---[ SITE_CREATION_ONLY: skipping credential check, Phase 2 and Phase 3 ]---")
+    # Site-creation-only mode (or both browser phases off) stops here:
+    # no credential prompt, no reset, no login.
+    if not browser_phases:
+        print("\n---[ No browser phases enabled: skipping credential check, Phase 2 and Phase 3 ]---")
         return page
 
     # ---[ Credential Check: skip the whole reset flow if a working password is already known ]---
-    existing_password = global_wp_admin_password
+    print("\n---[ Credential Check ]---")
+    existing_password = settings.global_wp_admin_password
     if existing_password:
-        print("\n---[ Credential Check ]---")
-        print(f"  ℹ️ Using the hardcoded GLOBAL_WP_ADMIN_PASSWORD for {origin_url} — skipping prompt, Phase 2, and password reset.")
-    elif always_skip_password_prompt:
-        print("\n---[ Credential Check ]---")
-        print(f"  ℹ️ ALWAYS_SKIP_PASSWORD_PROMPT is set — skipping the prompt and going straight to the password reset flow for {origin_url}.")
-    elif DO_PHASE_2_REQUEST_RESET or DO_PHASE_3_PROCESS_MIGRATION:
-        print("\n---[ Credential Check ]---")
+        print(f"  ℹ️ Using the hardcoded GLOBAL_WP_ADMIN_PASSWORD for {origin_url} — skipping Phase 2 and the password reset.")
+    elif settings.verbose_questions:
         existing_password = input(
             f" If you already have a working password for {target_email} on {origin_url}, "
             f"paste it now to skip straight to login (or press Enter to go through the password reset flow, "
@@ -679,31 +819,26 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
 
         if existing_password.lower() == "skip":
             print(f"⏭️  Skipping {origin_url} — no migration triggered for this site.")
+            record["status"] = "Skipped at the credential check"
             return page
+    else:
+        print(f"  ℹ️ VERBOSE_QUESTIONS is off — going straight to the password reset flow for {origin_url}.")
 
     if existing_password:
         if not DO_PHASE_3_PROCESS_MIGRATION:
             print("\n---[ SKIPPED: Phase 3 disabled, existing password not used ]---")
+            record["status"] = "Skipped: Phase 3 disabled"
             return page
 
         print("\n---[ Using existing password — skipping Phase 2 and the password reset step ]---")
-
-        # Safeguard: if API gathering failed, fall back to manual input
+        sftp_data = sftp_data or prompt_for_sftp_details()
         if not sftp_data:
-            print("⚠️ WARNING: API data gathering failed. No SFTP credentials available.")
-            manual_staging = input(" Enter Target Staging URL: ").strip()
-            manual_sftp_user = input(" Enter SFTP Username: ").strip()
-            manual_sftp_password = input(" Enter SFTP Password: ").strip()
+            print(f"⏭️  Skipping {origin_url} — no SFTP details available.")
+            record["status"] = "Skipped: no SFTP details available"
+            return page
 
-            sftp_data = {
-                "staging": manual_staging,
-                "sftp_user": manual_sftp_user,
-                "sftp_password": manual_sftp_password
-            }
-
-        await process_existing_password_migration(
-            page, existing_password, target_email, migration_email, sftp_data, base_url, wp_login_url
-        )
+        await start_migration(page, existing_password, target_email, settings.migration_email,
+                              sftp_data, origin_url, wp_login_url, enable_maintenance, record)
         return page
 
     # ---[ PHASE 2: Request Reset ]---
@@ -713,55 +848,85 @@ async def process_single_site(token, origin_url, page, datacenter, target_email,
         phase2_status, page = await request_password_reset(page, wp_login_url, target_email)
         if phase2_status == "no_user":
             print(f"⏭️  Skipping {origin_url} — no account exists for {target_email} on the origin site.")
+            record["status"] = f"Skipped: no account for {target_email} on the origin site"
             return page
     else:
         print("\n---[ SKIPPED PHASE 2: Request Reset ]---")
 
     # ---[ PHASE 3: Process Reset & Migrate ]---
-    if DO_PHASE_3_PROCESS_MIGRATION:
-        print("\n---[ PHASE 3: Origin Site Automation (Migrate) ]---")
-
-        # Safeguard: if API gathering failed, fall back to manual input
-        if not sftp_data:
-            print("⚠️ WARNING: API data gathering failed. No SFTP credentials available.")
-            manual_staging = input(" Enter Target Staging URL: ").strip()
-            manual_sftp_user = input(" Enter SFTP Username: ").strip()
-            manual_sftp_password = input(" Enter SFTP Password: ").strip()
-
-            sftp_data = {
-                "staging": manual_staging,
-                "sftp_user": manual_sftp_user,
-                "sftp_password": manual_sftp_password
-            }
-
-        print("\n==================================================")
-        if phase2_status == "failed":
-            print(f" [ACTION REQUIRED] The automatic password reset request failed for {origin_url} after retrying.")
-            print(f" Manually trigger a password reset email for {target_email} on that site, then paste the link below.")
-        else:
-            print(f" [ACTION REQUIRED] Check your email for the reset link for {origin_url}.")
-        reset_link = input(" Paste the full reset link, or type 'skip' to skip this site, and press Enter: ").strip()
-        print("==================================================\n")
-
-        if not reset_link or reset_link.lower() == "skip":
-            print(f"⏭️  Skipping {origin_url} — no migration triggered for this site.")
-            return page
-
-        # Complete reset and initiate migration
-        await process_reset_and_migrate(
-            page,
-            reset_link,
-            new_password,
-            target_email,
-            migration_email,
-            sftp_data,
-            base_url,
-            wp_login_url
-        )
-    else:
+    if not DO_PHASE_3_PROCESS_MIGRATION:
         print("\n---[ SKIPPED PHASE 3: Process Reset & Migrate ]---")
+        if phase2_status == "success":
+            record["status"] = "Password reset requested (Phase 3 disabled)"
+        return page
 
+    print("\n---[ PHASE 3: Origin Site Automation (Migrate) ]---")
+
+    # Safeguard: if API gathering failed, fall back to manual input
+    sftp_data = sftp_data or prompt_for_sftp_details()
+    if not sftp_data:
+        print(f"⏭️  Skipping {origin_url} — no SFTP details available.")
+        record["status"] = "Skipped: no SFTP details available"
+        return page
+
+    print("\n==================================================")
+    if phase2_status == "failed":
+        print(f" [ACTION REQUIRED] The automatic password reset request failed for {origin_url} after retrying.")
+        print(f" Manually trigger a password reset email for {target_email} on that site, then paste the link below.")
+    else:
+        print(f" [ACTION REQUIRED] Check your email for the reset link for {origin_url}.")
+    reset_link = input(" Paste the full reset link, or type 'skip' to skip this site, and press Enter: ").strip()
+    print("==================================================\n")
+
+    if not reset_link or reset_link.lower() == "skip":
+        print(f"⏭️  Skipping {origin_url} — no migration triggered for this site.")
+        record["status"] = "Skipped at the reset link prompt"
+        return page
+
+    # A new password for every site, so one leaked password only affects one site
+    new_password = generate_password()
+    try:
+        await reset_password_on_origin(page, reset_link, new_password)
+    except Exception as e:
+        print(f"  ❌ Error during password reset: {str(e)[:100]}")
+        # The form may have been submitted before the error, so keep the
+        # password in the summary in case it did change
+        print(f"  ℹ️ If the reset did go through, the new password is: {new_password}")
+        record["wp_password"] = f"{new_password} (unconfirmed — reset step failed)"
+        record["status"] = f"Failed during password reset: {str(e)[:100]}"
+        return page
+
+    record["wp_password"] = new_password
+    await start_migration(page, new_password, target_email, settings.migration_email,
+                          sftp_data, origin_url, wp_login_url, enable_maintenance, record)
     return page
+
+
+async def process_all_sites(token, origin_lines, page, settings):
+    """Run process_single_site() for every line in ORIGIN_URLS, carrying on to
+    the next site if one fails. Returns (site_summary, page)."""
+    site_summary = []
+    for index, line in enumerate(origin_lines, start=1):
+        origin_url, wp_login_url = parse_origin_line(line, settings.custom_login_url)
+
+        # This site's entry in the end-of-run summary, filled in as it goes
+        record = {"origin": origin_url or line, "status": "Not finished"}
+        site_summary.append(record)
+
+        print(f"\n==================== Site {index} of {len(origin_lines)}: {origin_url or line} ====================")
+        if not origin_url:
+            print(f"❌ Could not read a site URL from '{line}' — skipping.")
+            record["status"] = "Skipped: could not read a URL from this line"
+            continue
+
+        try:
+            page = await process_single_site(token, origin_url, wp_login_url, page, settings, record)
+        except Exception as e:
+            print(f"❌ Unhandled error processing {origin_url}: {str(e)[:200]}")
+            print("   Moving on to the next site...")
+            record["status"] = f"Failed: unhandled error: {str(e)[:150]}"
+
+    return site_summary, page
 
 
 # ---[ MAIN EXECUTION LOOP ]---
@@ -771,31 +936,45 @@ async def main():
     print("    PRESSABLE BULK MIGRATION SCRIPT              ")
     print("==================================================\n")
 
-    # 1. Load Hardcoded Inputs
+    # 1. Load and check the hardcoded settings before anything is created
     client_id = CLIENT_ID.strip()
     client_secret = CLIENT_SECRET.strip()
-    # Blank means "ask for each site" (handled in process_single_site)
-    datacenter = DATACENTER.strip().upper()
-    target_email = TARGET_EMAIL.strip()
-    migration_email = MIGRATION_EMAIL.strip()
+    settings = Settings(
+        # Blank means "ask for each site" (handled in process_single_site)
+        datacenter=DATACENTER.strip().upper(),
+        target_email=TARGET_EMAIL.strip(),
+        migration_email=MIGRATION_EMAIL.strip(),
+        custom_site_name=CUSTOM_SITE_NAME.strip(),
+        custom_login_url=CUSTOM_LOGIN_URL.strip(),
+        global_wp_admin_password=GLOBAL_WP_ADMIN_PASSWORD.strip(),
+        verbose_questions=VERBOSE_QUESTIONS,
+        enable_maintenance_mode=ENABLE_MAINTENANCE_MODE,
+    )
+    need_browser = DO_PHASE_2_REQUEST_RESET or DO_PHASE_3_PROCESS_MIGRATION
 
-    custom_site_name = CUSTOM_SITE_NAME.strip()
-    custom_login_url = CUSTOM_LOGIN_URL.strip()
-    global_wp_admin_password = GLOBAL_WP_ADMIN_PASSWORD.strip()
-    always_skip_password_prompt = ALWAYS_SKIP_PASSWORD_PROMPT
+    if not client_id or not client_secret:
+        print("❌ CLIENT_ID and CLIENT_SECRET must both be set. Exiting.")
+        return
 
-    origin_urls = [u.strip() for u in ORIGIN_URLS if u.strip()]
-    if not origin_urls:
+    origin_lines = [u.strip() for u in ORIGIN_URLS.strip().splitlines() if u.strip()]
+    if not origin_lines:
         print("❌ ORIGIN_URLS is empty. Add at least one URL and re-run. Exiting.")
         return
 
     # Catch a mistyped DATACENTER now, before anything is created
-    if datacenter and datacenter not in VALID_DATACENTERS:
-        print(f"❌ DATACENTER '{datacenter}' is not valid. Use one of: {', '.join(VALID_DATACENTERS)} "
+    if settings.datacenter and settings.datacenter not in VALID_DATACENTERS:
+        print(f"❌ DATACENTER '{settings.datacenter}' is not valid. Use one of: {', '.join(VALID_DATACENTERS)} "
               "(or leave it blank to be asked per site). Exiting.")
         return
-    if not datacenter and DO_PHASE_1_CREATE_SITE:
+    if not settings.datacenter and DO_PHASE_1_CREATE_SITE:
         print("ℹ️ DATACENTER is blank — you will be asked which datacenter to use for each site.")
+
+    if need_browser and not settings.target_email:
+        print("❌ TARGET_EMAIL must be set to log in to the origin sites. Exiting.")
+        return
+    if DO_PHASE_3_PROCESS_MIGRATION and not settings.migration_email:
+        print("❌ MIGRATION_EMAIL must be set to start migrations. Exiting.")
+        return
 
     if SITE_CREATION_ONLY:
         print("ℹ️ SITE_CREATION_ONLY is set — sites will be created and their details printed, "
@@ -806,22 +985,17 @@ async def main():
             print("⚠️ DO_PHASE_1_CREATE_SITE is False, so no sites will be created — this run will only "
                   "look up existing sites and RESET their SFTP passwords.")
 
-    # Collects each site's details (or error) for the summary at the end of the run
-    site_summary = []
-
     # ---[ API Authentication (shared across all sites) ]---
     print("\n---[ Authenticating with Pressable API ]---")
     token = get_access_token(client_id, client_secret)
     print("✅ Authentication OK.")
-
-    need_browser = DO_PHASE_2_REQUEST_RESET or DO_PHASE_3_PROCESS_MIGRATION
 
     if need_browser:
         user_data_dir = tempfile.mkdtemp()
 
         async with async_playwright() as p:
 
-            # --- NEW: Configure context with Basic Auth if provided ---
+            # Configure the browser, with Basic Auth if provided
             context_args = {
                 "headless": False, # Keep false so you can watch it happen
                 "slow_mo": 1000,
@@ -838,46 +1012,23 @@ async def main():
 
             context = await p.chromium.launch_persistent_context(user_data_dir, **context_args)
 
-            # --- FIXED STEALTH APPLICATION ---
             stealth = Stealth()
             await stealth.apply_stealth_async(context)
 
             page = context.pages[0]
 
-            for index, origin_url in enumerate(origin_urls, start=1):
-                print(f"\n==================== Site {index} of {len(origin_urls)}: {origin_url} ====================")
-                try:
-                    page = await process_single_site(
-                        token, origin_url, page, datacenter, target_email, migration_email,
-                        custom_site_name, custom_login_url, global_wp_admin_password,
-                        always_skip_password_prompt, site_summary
-                    )
-                except Exception as e:
-                    print(f"❌ Unhandled error processing {origin_url}: {str(e)[:200]}")
-                    print("   Moving on to the next site...")
+            # Print the BlogVault URL whenever the migration plugin hands over to it
+            page.on("framenavigated", lambda frame: print(f"\n  🌐 Captured BlogVault Navigation: {frame.url}\n") if "migrate.blogvault.net" in frame.url else None)
+
+            site_summary, page = await process_all_sites(token, origin_lines, page, settings)
+            print_site_summary(site_summary)
 
             print("\n🎉 Bulk automation complete! The browser will remain open so you can verify.")
             print(f"👉 Current Browser URL: {page.url}")
             await asyncio.Event().wait()
     else:
-        for index, origin_url in enumerate(origin_urls, start=1):
-            print(f"\n==================== Site {index} of {len(origin_urls)}: {origin_url} ====================")
-            try:
-                await process_single_site(
-                    token, origin_url, None, datacenter, target_email, migration_email,
-                    custom_site_name, custom_login_url, global_wp_admin_password,
-                    always_skip_password_prompt, site_summary
-                )
-            except Exception as e:
-                print(f"❌ Unhandled error processing {origin_url}: {str(e)[:200]}")
-                print("   Moving on to the next site...")
-                site_summary.append({"origin": origin_url, "error": f"Unhandled error: {str(e)[:200]}"})
-
-        # The summary is only shown in SITE_CREATION_ONLY mode, where the run is
-        # all about collecting each new site's details in one place.
-        if SITE_CREATION_ONLY:
-            print_site_summary(site_summary)
-
+        site_summary, _ = await process_all_sites(token, origin_lines, None, settings)
+        print_site_summary(site_summary)
         print("\n🎉 Bulk automation complete!")
 
 if __name__ == "__main__":
