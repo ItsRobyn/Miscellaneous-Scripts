@@ -79,6 +79,47 @@ VALID_DATACENTERS = {
     "DFW": "Dallas, TX, USA",
 }
 
+# Datacenters that are in Europe. Used by the TLD check below to warn when a
+# site looks European but is going to a non-European datacenter (or the other
+# way round). If Pressable adds another European datacenter, add it here.
+EUROPEAN_DATACENTERS = {"AMS"}
+
+# TLDs that suggest a site's audience is in or near the EU. This is only a
+# hint (plenty of European sites use .com), so a match triggers a warning and
+# an extra confirmation, never a hard stop.
+# Deliberately NOT included, because they are widely used as generic names
+# worldwide and would cause false alarms: .me, .gg, .md, .co, .io, .tv, .fm
+EUROPEAN_TLDS = {
+    # EU member states, plus .eu itself
+    "eu", "at", "be", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de",
+    "gr", "hu", "ie", "it", "lv", "lt", "lu", "mt", "nl", "pl", "pt", "ro",
+    "sk", "si", "es", "se",
+    # Near-EU countries, microstates and Crown Dependencies
+    "uk", "ch", "no", "is", "li", "ad", "mc", "sm", "va", "al", "ba", "mk",
+    "rs", "xk", "ua", "gi", "im", "je", "fo", "ax", "nu",
+    # European city and region TLDs
+    "berlin", "hamburg", "koeln", "cologne", "bayern", "nrw", "saarland",
+    "wien", "tirol", "paris", "alsace", "bzh", "corsica", "london", "scot",
+    "wales", "cymru", "amsterdam", "frl", "brussels", "vlaanderen", "gent",
+    "cat", "barcelona", "madrid", "eus", "gal", "swiss", "zuerich",
+    "stockholm", "helsinki", "oslo", "irish", "lat",
+}
+
+# TLDs that clearly suggest a site's audience is outside Europe. Used for the
+# reverse check: flagged when the datacenter IS European. Same caveat as above.
+NON_EUROPEAN_TLDS = {
+    # North and South America
+    "us", "ca", "mx", "br", "ar", "cl", "pe", "uy",
+    # Asia-Pacific
+    "au", "nz", "jp", "cn", "hk", "tw", "kr", "sg", "my", "th", "vn", "ph",
+    "id", "in", "pk",
+    # Middle East and Africa
+    "ae", "sa", "qa", "za", "ng", "ke",
+    # City and region TLDs outside Europe
+    "nyc", "boston", "miami", "vegas", "quebec", "sydney", "melbourne",
+    "tokyo", "osaka", "nagoya", "yokohama",
+}
+
 # Set a custom name for the Pressable site.
 # If left blank (""), it will automatically extract the name from each origin URL.
 CUSTOM_SITE_NAME = ""
@@ -629,12 +670,67 @@ async def start_migration(page, password, target_email, migration_email, sftp_da
 
 # ---[ PROMPT HELPERS ]---
 
+def get_tld(domain_or_url: str) -> str:
+    """Return the last part of a site's hostname, e.g. "se" for
+    https://example.se/ or "uk" for example.co.uk. Returns "" if no hostname
+    can be read. Accepts a full ORIGIN_URLS line (only the first column is used)."""
+    first_column = domain_or_url.strip().split()[0] if domain_or_url.strip() else ""
+    hostname = extract_hostname(first_column).rstrip(".")
+    return hostname.rsplit(".", 1)[-1] if "." in hostname else ""
+
+
+def find_region_mismatches(datacenter: str, origin_lines: list) -> list:
+    """Return the hostnames whose TLD suggests a different region from the
+    datacenter: European TLDs going to a non-European datacenter, or clearly
+    non-European TLDs going to a European one."""
+    if datacenter in EUROPEAN_DATACENTERS:
+        suspicious_tlds = NON_EUROPEAN_TLDS
+    else:
+        suspicious_tlds = EUROPEAN_TLDS
+
+    mismatches = []
+    for line in origin_lines:
+        if get_tld(line) in suspicious_tlds:
+            mismatches.append(extract_hostname(line.split()[0]))
+    return mismatches
+
+
+def region_mismatch_explanation(datacenter: str) -> str:
+    """One-line description of the mismatch, for use in warnings."""
+    location = VALID_DATACENTERS.get(datacenter, "Unknown location")
+    if datacenter in EUROPEAN_DATACENTERS:
+        return f"non-European TLDs, but {datacenter} ({location}) is a European datacenter"
+    return f"European TLDs, but {datacenter} ({location}) is NOT a European datacenter"
+
+
+def confirm_region_mismatch(datacenter: str, hostnames: list, otherwise: str = "stop") -> bool:
+    """Show the sites whose TLD doesn't match the datacenter's region and make
+    the user type the datacenter code to carry on. Deliberately harder than a
+    y/n, so it can't be skipped out of habit. Anything else (including no
+    input at all) returns False. `otherwise` says what happens in that case
+    (e.g. "stop" or "choose again"), so the prompt is accurate."""
+    print("\n" + "!" * 60)
+    print(f"!! TLD WARNING: {len(hostnames)} site(s) have {region_mismatch_explanation(datacenter)}:")
+    for hostname in hostnames:
+        print(f"!!    - {hostname}")
+    print("!! This may be fine (it's only a hint), but double-check before going on.")
+    print("!" * 60)
+    try:
+        answer = input(f" Type {datacenter} to continue with this datacenter anyway, or anything else to {otherwise}: ")
+    except EOFError:
+        print("\n ⚠️ No answer received.")
+        return False
+    return answer.strip().upper() == datacenter
+
+
 def prompt_for_datacenter(origin_url: str) -> str:
     """Interactively ask which datacenter to create the site in.
 
     Used when DATACENTER is left blank. Shows a numbered list of the codes in
     VALID_DATACENTERS and accepts either the number or the code itself
-    (case-insensitive). Keeps asking until a valid answer is given."""
+    (case-insensitive). Keeps asking until a valid answer is given. If the
+    chosen datacenter doesn't match the region the site's TLD suggests, the
+    choice must be confirmed by typing the code, otherwise it asks again."""
     codes = list(VALID_DATACENTERS.keys())
     print(f"\nWhich datacenter should the site for {origin_url} be created in?")
     for number, code in enumerate(codes, start=1):
@@ -645,12 +741,79 @@ def prompt_for_datacenter(origin_url: str) -> str:
 
         # Accept the list number (e.g. "2")...
         if answer.isdigit() and 1 <= int(answer) <= len(codes):
-            return codes[int(answer) - 1]
+            choice = codes[int(answer) - 1]
         # ...or the code itself (e.g. "BUR")
-        if answer in VALID_DATACENTERS:
-            return answer
+        elif answer in VALID_DATACENTERS:
+            choice = answer
+        else:
+            print(f" ⚠️ '{answer}' is not a valid choice. Please enter 1-{len(codes)} or one of: {', '.join(codes)}")
+            continue
 
-        print(f" ⚠️ '{answer}' is not a valid choice. Please enter 1-{len(codes)} or one of: {', '.join(codes)}")
+        # TLD check: does this site's TLD suggest a different region?
+        mismatches = find_region_mismatches(choice, [origin_url])
+        if mismatches and not confirm_region_mismatch(choice, mismatches, otherwise="choose again"):
+            print(" ↩️ Not confirmed — choose the datacenter again.")
+            continue
+        return choice
+
+
+def confirm_datacenter(datacenter: str, origin_lines: list) -> bool:
+    """Show a large, hard-to-miss banner naming the datacenter every site will
+    be created in, and make the user confirm it before anything happens.
+
+    Only called when DATACENTER is set and Phase 1 (site creation) is on.
+    Returns True for "y"/"yes" and False for "n"/"no" (any capitals). Any
+    other answer is asked again rather than guessed at. If the input stream
+    closes (Ctrl+D, or no terminal attached) it returns False, so the script
+    never carries on without a real confirmation.
+
+    If any site's TLD suggests a different region from the datacenter, those
+    sites are listed and the user must also type the datacenter code."""
+    site_count = len(origin_lines)
+    location = VALID_DATACENTERS.get(datacenter, "Unknown location")
+    plural = "site" if site_count == 1 else "sites"
+    these = "this site" if site_count == 1 else "these sites"
+    mismatches = find_region_mismatches(datacenter, origin_lines)
+    bar = "█" * 60
+
+    # Pad each line to the same width so the box edges line up
+    lines = [
+        # (No emoji inside the box: their display width varies between
+        # terminals and would knock the right-hand edge out of line.)
+        "!!  CHECK THE DATACENTER BEFORE CONTINUING  !!",
+        "",
+        f"DATACENTER:  {datacenter}  —  {location}",
+        "",
+        f"ALL {site_count} {plural.upper()} in ORIGIN_URLS will be created here.",
+    ]
+    if mismatches:
+        lines += ["", f"TLD WARNING: {len(mismatches)} site(s) may not suit this region."]
+    print("\n" + bar)
+    print(bar)
+    for line in lines:
+        print(f"██  {line:<52}  ██")
+    print(bar)
+    print(bar + "\n")
+
+    while True:
+        try:
+            answer = input(f" Is {datacenter} ({location}) the correct datacenter for {these}? [y/n]: ")
+        except EOFError:
+            # No answer can be read, so treat it as "no" rather than proceeding
+            print("\n ⚠️ No answer received.")
+            return False
+
+        answer = answer.strip().lower()
+        if answer in ("n", "no"):
+            return False
+        if answer in ("y", "yes"):
+            break
+        print(f" ⚠️ '{answer}' is not a valid answer. Please type y, yes, n or no.")
+
+    # Datacenter confirmed; now the extra check for sites that look mismatched
+    if mismatches:
+        return confirm_region_mismatch(datacenter, mismatches)
+    return True
 
 
 def prompt_for_sftp_details():
@@ -968,6 +1131,16 @@ async def main():
         return
     if not settings.datacenter and DO_PHASE_1_CREATE_SITE:
         print("ℹ️ DATACENTER is blank — you will be asked which datacenter to use for each site.")
+
+    # Make the user explicitly confirm the datacenter before any site is created.
+    # Skipped when DATACENTER is blank (asked per site instead) or Phase 1 is off
+    # (no sites are created, so the datacenter isn't used).
+    if settings.datacenter and DO_PHASE_1_CREATE_SITE:
+        if not confirm_datacenter(settings.datacenter, origin_lines):
+            print("\n🛑 Stopped — datacenter not confirmed. Nothing has been created.")
+            print("   Change DATACENTER at the top of the script and re-run.")
+            return
+        print(f"✅ Datacenter {settings.datacenter} confirmed.")
 
     if need_browser and not settings.target_email:
         print("❌ TARGET_EMAIL must be set to log in to the origin sites. Exiting.")
